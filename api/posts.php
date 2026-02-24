@@ -1,121 +1,117 @@
 <?php
-// api/auth.php
+// api/posts.php
 
-// Подключаем наши базовые файлы
 require_once '../core/db.php';
 require_once '../core/response.php';
 
-// Инициализируем подключение
 $database = new Database();
 $db = $database->getConnection();
 
-// Получаем действие из URL, например: api/auth.php?action=login
 $action = isset($_GET['action']) ? $_GET['action'] : '';
 
-// Получаем тело запроса (Retrofit отправляет данные в формате JSON)
-$data = json_decode(file_get_contents("php://input"));
-
 switch ($action) {
-    case 'register':
-        // Проверяем, что переданы все необходимые данные
-        if (empty($data->phone) || empty($data->password) || empty($data->name)) {
-            sendJsonResponse(400, false, "Заполните все обязательные поля: phone, password, name.");
-        }
-
-        $phone = htmlspecialchars(strip_tags($data->phone));
-        $name = htmlspecialchars(strip_tags($data->name));
-        $password = $data->password;
-
-        // Проверяем, существует ли уже пользователь с таким телефоном
-        $check_query = "SELECT user_id FROM users WHERE phone = :phone LIMIT 1";
-        $stmt = $db->prepare($check_query);
-        $stmt->bindParam(':phone', $phone);
-        $stmt->execute();
-
-        if ($stmt->rowCount() > 0) {
-            sendJsonResponse(409, false, "Пользователь с таким номером телефона уже зарегистрирован.");
-        }
-
-        // Хэшируем пароль для безопасности
-        $password_hash = password_hash($password, PASSWORD_DEFAULT);
-
-        // По умолчанию делаем тип пользователя 'user'
-        $user_type = 'user';
-
-        // Генерируем уникальный API токен
-        $api_token = bin2hex(random_bytes(32));
-
-        // Добавляем пользователя
-        $insert_query = "INSERT INTO users (phone, password, name, user_type, api_token, created_at, updated_at) 
-                         VALUES (:phone, :password, :name, :user_type, :api_token, NOW(), NOW())";
-        $stmt = $db->prepare($insert_query);
-        $stmt->bindParam(':phone', $phone);
-        $stmt->bindParam(':password', $password_hash);
-        $stmt->bindParam(':name', $name);
-        $stmt->bindParam(':user_type', $user_type);
-        $stmt->bindParam(':api_token', $api_token);
-
-        if ($stmt->execute()) {
-            $user_id = $db->lastInsertId();
-            sendJsonResponse(201, true, "Регистрация прошла успешно.", [
-                "user_id" => $user_id,
-                "api_token" => $api_token
-            ]);
+    case 'feed':
+        // Получаем параметры для пагинации
+        $page = isset($_GET['page']) ? (int)$_GET['page'] : 1;
+        $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 10;
+        $cat_id = isset($_GET['cat_id']) ? (int)$_GET['cat_id'] : null;
+        
+        $offset = ($page - 1) * $limit;
+        
+        // Если передана категория, фильтруем через связующую таблицу s_categories
+        if ($cat_id) {
+            $query = "SELECT p.* FROM post p
+                      JOIN s_categories sc ON p.post_id = sc.post_id
+                      WHERE p.status = 1 AND sc.cat_id = :cat_id
+                      ORDER BY p.created_at DESC LIMIT :limit OFFSET :offset";
+            $stmt = $db->prepare($query);
+            $stmt->bindParam(':cat_id', $cat_id, PDO::PARAM_INT);
         } else {
-            sendJsonResponse(500, false, "Ошибка при регистрации пользователя.");
+            // Обычная лента всех активных постов
+            $query = "SELECT * FROM post WHERE status = 1 ORDER BY created_at DESC LIMIT :limit OFFSET :offset";
+            $stmt = $db->prepare($query);
         }
+        
+        // PDO требует явного указания PDO::PARAM_INT для LIMIT и OFFSET
+        $stmt->bindParam(':limit', $limit, PDO::PARAM_INT);
+        $stmt->bindParam(':offset', $offset, PDO::PARAM_INT);
+        $stmt->execute();
+        
+        $posts = $stmt->fetchAll();
+        
+        // Для удобства Android-разработчика можно парсить JSON поле attributes сразу в объект
+        foreach ($posts as &$post) {
+            if (!empty($post['attributes'])) {
+                $post['attributes'] = json_decode($post['attributes'], true);
+            }
+        }
+        
+        sendJsonResponse(200, true, "Лента заведений", [
+            "posts" => $posts, 
+            "page" => $page,
+            "limit" => $limit
+        ]);
         break;
 
-    case 'login':
-        // Проверка входных данных
-        if (empty($data->phone) || empty($data->password)) {
-            sendJsonResponse(400, false, "Укажите телефон и пароль.");
-        }
-
-        $phone = htmlspecialchars(strip_tags($data->phone));
-        $password = $data->password;
-
-        // Ищем пользователя по телефону
-        $query = "SELECT * FROM users WHERE phone = :phone LIMIT 1";
+    case 'popular':
+        // Вывод популярных заведений (например, для горизонтального скролла на главном экране)
+        $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 5;
+        
+        $query = "SELECT * FROM post WHERE status = 1 ORDER BY views DESC LIMIT :limit";
         $stmt = $db->prepare($query);
-        $stmt->bindParam(':phone', $phone);
+        $stmt->bindParam(':limit', $limit, PDO::PARAM_INT);
         $stmt->execute();
-
-        if ($stmt->rowCount() > 0) {
-            $user = $stmt->fetch();
-
-            // Проверяем совпадение пароля
-            if (password_verify($password, $user['password'])) {
-                
-                // Генерируем новый токен при каждом входе для безопасности
-                $api_token = bin2hex(random_bytes(32));
-
-                // Обновляем время последнего входа и токен
-                $update_login = "UPDATE users SET login_time = NOW(), api_token = :api_token WHERE user_id = :user_id";
-                $update_stmt = $db->prepare($update_login);
-                $update_stmt->bindParam(':api_token', $api_token);
-                $update_stmt->bindParam(':user_id', $user['user_id']);
-                $update_stmt->execute();
-
-                // Убираем хэш пароля из ответа для безопасности
-                unset($user['password']);
-                // Добавляем актуальный токен в массив пользователя для ответа
-                $user['api_token'] = $api_token;
-
-                // Отправляем успешный ответ с данными пользователя
-                sendJsonResponse(200, true, "Успешный вход.", [
-                    "user" => $user
-                ]);
-            } else {
-                sendJsonResponse(401, false, "Неверный пароль.");
+        
+        $posts = $stmt->fetchAll();
+        
+        foreach ($posts as &$post) {
+            if (!empty($post['attributes'])) {
+                $post['attributes'] = json_decode($post['attributes'], true);
             }
-        } else {
-            sendJsonResponse(404, false, "Пользователь с таким номером не найден.");
         }
+        
+        sendJsonResponse(200, true, "Популярные заведения", ["posts" => $posts]);
+        break;
+
+    case 'detail':
+        // Детальная карточка заведения
+        $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+        if (!$id) {
+            sendJsonResponse(400, false, "Не указан ID заведения (?id=...)");
+        }
+
+        // 1. Получаем основную информацию
+        $query = "SELECT * FROM post WHERE post_id = :id AND status = 1 LIMIT 1";
+        $stmt = $db->prepare($query);
+        $stmt->bindParam(':id', $id, PDO::PARAM_INT);
+        $stmt->execute();
+        
+        if ($stmt->rowCount() == 0) {
+            sendJsonResponse(404, false, "Заведение не найдено или скрыто");
+        }
+        
+        $post = $stmt->fetch();
+        if (!empty($post['attributes'])) {
+            $post['attributes'] = json_decode($post['attributes'], true);
+        }
+
+        // 2. Получаем расписание работы
+        $hours_query = "SELECT day_of_week, open_time, close_time, is_closed FROM post_working_hours WHERE post_id = :id";
+        $hours_stmt = $db->prepare($hours_query);
+        $hours_stmt->bindParam(':id', $id, PDO::PARAM_INT);
+        $hours_stmt->execute();
+        
+        $post['working_hours'] = $hours_stmt->fetchAll();
+
+        // 3. Увеличиваем счетчик просмотров (работает асинхронно для пользователя)
+        $update_views = "UPDATE post SET views = views + 1 WHERE post_id = :id";
+        $db->prepare($update_views)->execute([':id' => $id]);
+
+        sendJsonResponse(200, true, "Детали заведения", ["post" => $post]);
         break;
 
     default:
-        sendJsonResponse(400, false, "Неизвестное действие (action). Используйте ?action=register или ?action=login");
+        sendJsonResponse(400, false, "Неизвестное действие. Используйте ?action=feed, popular или detail");
         break;
 }
 ?>
